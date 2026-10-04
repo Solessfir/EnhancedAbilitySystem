@@ -103,18 +103,20 @@ float UEnhancedGameplayAbility::GetCooldownDuration() const
 {
 	const float AbilityLevel = GetAbilityLevel();
 
-	if (CooldownDuration.IsSet())
-	{
-		return CooldownDuration.GetValue().GetValueAtLevel(AbilityLevel);
-	}
-
 	const UGameplayEffect* CooldownGE = GetCooldownGameplayEffect();
 	if (!CooldownGE || CooldownGE->DurationPolicy != EGameplayEffectDurationType::HasDuration)
 	{
 		return 0.f;
 	}
 
-	// CooldownDuration is not set - try read directly from GE
+	if (CooldownDuration.IsSet() && CooldownTag.IsValid()
+		&& CooldownGE->DurationMagnitude.GetMagnitudeCalculationType() == EGameplayEffectMagnitudeCalculation::SetByCaller
+		&& CooldownGE->DurationMagnitude.GetSetByCallerFloat().DataTag.IsValid())
+	{
+		return FMath::Max(CooldownDuration.GetValue().GetValueAtLevel(AbilityLevel), 0.01f);
+	}
+
+	// Read authored duration when the override cannot be applied.
 	if (float OutMagnitude = 0.f; CooldownGE->DurationMagnitude.GetStaticMagnitudeIfPossible(AbilityLevel, OutMagnitude))
 	{
 		return OutMagnitude;
@@ -152,7 +154,7 @@ void UEnhancedGameplayAbility::ApplyCooldown(const FGameplayAbilitySpecHandle Ha
 	// CooldownTag per-ability path
 	if (CooldownTag.IsValid())
 	{
-		const FGameplayEffectSpecHandle SpecHandle = MakeOutgoingGameplayEffectSpec(CooldownGameplayEffect->GetClass(), GetAbilityLevel(Handle, ActorInfo));
+		const FGameplayEffectSpecHandle SpecHandle = MakeOutgoingGameplayEffectSpec(Handle, ActorInfo, ActivationInfo, CooldownGameplayEffect->GetClass(), GetAbilityLevel(Handle, ActorInfo));
 		FGameplayEffectSpec* Spec = SpecHandle.Data.Get();
 		if (!Spec)
 		{

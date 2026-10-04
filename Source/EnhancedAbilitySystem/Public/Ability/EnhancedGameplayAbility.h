@@ -57,8 +57,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ability|Cooldown")
 	bool HasCooldownDuration() const;
 
-	// Effective cooldown length at current ability level: optional CooldownDuration if set, otherwise
-	// the Cooldown GE's static duration magnitude when readable. 0 if infinite/instant/unknown (e.g. pure SetByCaller GE with no optional override).
+	// Cooldown length at current ability level: optional duration when the tagged SetByCaller GE can use it,
+	// otherwise the GE's static duration magnitude when readable. 0 if missing/infinite/instant/unknown.
 	// For remaining time use engine GetCooldownTimeRemaining (respects overridden GetCooldownTags).
 	UFUNCTION(BlueprintPure, Category = "Ability|Cooldown")
 	float GetCooldownDuration() const;

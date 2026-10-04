@@ -5,7 +5,9 @@
 #include "EnhancedInputComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Logging/StructuredLog.h"
+#include "TimerManager.h"
 #include UE_INLINE_GENERATED_CPP_BY_NAME(EnhancedAbilitySystemComponent)
 
 DEFINE_LOG_CATEGORY_STATIC(LogEnhancedAbilitySystemComponent, Log, All);
@@ -14,11 +16,73 @@ DEFINE_LOG_CATEGORY_STATIC(LogEnhancedAbilitySystemComponent, Log, All);
 // Ability Grant / Lifecycle
 // ----------------------------------------------------------------------------------------------------------------
 
+void UEnhancedAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor)
+{
+	const AActor* PreviousAvatar = GetAvatarActor();
+	Super::InitAbilityActorInfo(InOwnerActor, InAvatarActor);
+
+	// A reentrant initialization can already have handled the control transition.
+	const bool bWasLocallyControlled = bActorInfoLocallyControlled;
+	bActorInfoLocallyControlled = AbilityActorInfo.IsValid() && AbilityActorInfo->OwnerActor.IsValid() && AbilityActorInfo->IsLocallyControlled();
+	const APlayerController* Controller = AbilityActorInfo.IsValid() ? AbilityActorInfo->PlayerController.Get() : nullptr;
+	if (PreviousAvatar != InAvatarActor || InAvatarActor != GetAvatarActor() || bWasLocallyControlled
+		|| !bActorInfoLocallyControlled || !Controller || !Controller->IsLocalController())
+	{
+		return;
+	}
+
+	// An unchanged avatar does not receive OnAvatarSet when its owning controller becomes available.
+	ABILITYLIST_SCOPE_LOCK();
+	for (const FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
+	{
+		const UEnhancedGameplayAbility* Ability = Cast<UEnhancedGameplayAbility>(Spec.GetPrimaryInstance());
+		if (!Ability)
+		{
+			Ability = Cast<UEnhancedGameplayAbility>(Spec.Ability);
+		}
+		if (Ability && Ability->bActivateOnGranted)
+		{
+			const EGameplayAbilityNetExecutionPolicy::Type NetPolicy = Ability->GetNetExecutionPolicy();
+			if (NetPolicy == EGameplayAbilityNetExecutionPolicy::LocalOnly || NetPolicy == EGameplayAbilityNetExecutionPolicy::LocalPredicted)
+			{
+				TryActivateAbilityOnGranted(Spec);
+			}
+		}
+	}
+}
+
 void UEnhancedAbilitySystemComponent::OnGiveAbility(FGameplayAbilitySpec& AbilitySpec)
 {
+	PruneAbilityGrantBatchProgress();
+	for (const FAbilityListLockActiveChange* Batch : AbilityListLockActiveChanges)
+	{
+		const int32 GrantIndex = Batch->Adds.IndexOfByPredicate([&AbilitySpec](const FGameplayAbilitySpec& Spec) { return Spec.Handle == AbilitySpec.Handle; });
+		if (GrantIndex != INDEX_NONE)
+		{
+			// Mark the source copy processed before grant callbacks can remove the committed spec.
+			AbilityGrantBatchNextIndices.FindOrAdd(Batch->Adds[0].Handle) = GrantIndex + 1;
+		}
+	}
+
 	Super::OnGiveAbility(AbilitySpec);
 
-	const UEnhancedGameplayAbility* EnhancedAbility = Cast<UEnhancedGameplayAbility>(AbilitySpec.Ability);
+	if (AbilitySpec.PendingRemove || bAbilityPendingClearAll)
+	{
+		return;
+	}
+
+	// Grant callbacks can already have installed a binding on the current avatar.
+	if (const FAbilityInputBinding* Binding = AbilityInputBindings.Find(AbilitySpec.Handle);
+		Binding && IsInputBindingCurrent(AbilitySpec.Handle, Binding->Generation))
+	{
+		return;
+	}
+
+	const UEnhancedGameplayAbility* EnhancedAbility = Cast<UEnhancedGameplayAbility>(AbilitySpec.GetPrimaryInstance());
+	if (!EnhancedAbility)
+	{
+		EnhancedAbility = Cast<UEnhancedGameplayAbility>(AbilitySpec.Ability);
+	}
 	if (!EnhancedAbility)
 	{
 		return;
@@ -29,13 +93,16 @@ void UEnhancedAbilitySystemComponent::OnGiveAbility(FGameplayAbilitySpec& Abilit
 
 void UEnhancedAbilitySystemComponent::OnRemoveAbility(FGameplayAbilitySpec& AbilitySpec)
 {
+	// Immediate removals must also be excluded from callback-time ownership queries.
+	AbilitySpec.PendingRemove = true;
 	Super::OnRemoveAbility(AbilitySpec);
 	ClearInputBinding(AbilitySpec.Handle);
+	AbilityInputEventGenerations.Remove(AbilitySpec.Handle);
 }
 
 void UEnhancedAbilitySystemComponent::TryActivateAbilityOnGranted(const FGameplayAbilitySpec& AbilitySpec)
 {
-	if (!AbilitySpec.Ability || AbilitySpec.IsActive() || AbilitySpec.PendingRemove)
+	if (!AbilitySpec.Ability || AbilitySpec.IsActive() || AbilitySpec.PendingRemove || bAbilityPendingClearAll)
 	{
 		return;
 	}
@@ -71,20 +138,63 @@ void UEnhancedAbilitySystemComponent::TryActivateAbilityOnGranted(const FGamepla
 
 FGameplayAbilitySpecHandle UEnhancedAbilitySystemComponent::GiveAbilityIfNotOwned(const TSubclassOf<UGameplayAbility> Ability, const int32 Level)
 {
-	if (!Ability || !IsOwnerActorAuthoritative())
+	if (!Ability || !IsOwnerActorAuthoritative() || bAbilityPendingClearAll)
 	{
 		return FGameplayAbilitySpecHandle();
 	}
 
-	if (const FGameplayAbilitySpec* Existing = FindAbilitySpecFromClass(Ability))
+	PruneAbilityGrantBatchProgress();
+
+	for (const FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
 	{
-		if (!Existing->PendingRemove)
+		if (!Spec.PendingRemove && Spec.Ability && Spec.Ability->GetClass() == Ability.Get())
 		{
-			return Existing->Handle;
+			return Spec.Handle;
+		}
+	}
+
+	// GiveAbility defers grants made inside ability callbacks until the list lock is released.
+	for (const FGameplayAbilitySpec& Spec : AbilityPendingAdds)
+	{
+		if (!Spec.PendingRemove && Spec.Ability && Spec.Ability->GetClass() == Ability.Get())
+		{
+			return Spec.Handle;
+		}
+	}
+
+	// Unlock moves queued grants into batches that retain copies of already processed specs.
+	for (const FAbilityListLockActiveChange* Batch : AbilityListLockActiveChanges)
+	{
+		if (Batch->Adds.IsEmpty())
+		{
+			continue;
+		}
+
+		for (int32 Index = AbilityGrantBatchNextIndices.FindRef(Batch->Adds[0].Handle); Index < Batch->Adds.Num(); ++Index)
+		{
+			const FGameplayAbilitySpec& Spec = Batch->Adds[Index];
+			if (Spec.PendingRemove || !IsValid(Spec.Ability) || Spec.Ability->GetClass() != Ability.Get())
+			{
+				continue;
+			}
+
+			return Spec.Handle;
 		}
 	}
 
 	return GiveAbility(FGameplayAbilitySpec(Ability, Level));
+}
+
+void UEnhancedAbilitySystemComponent::PruneAbilityGrantBatchProgress()
+{
+	for (auto Iterator = AbilityGrantBatchNextIndices.CreateIterator(); Iterator; ++Iterator)
+	{
+		const FGameplayAbilitySpecHandle BatchHandle = Iterator.Key();
+		if (!AbilityListLockActiveChanges.ContainsByPredicate([BatchHandle](const FAbilityListLockActiveChange* Batch) { return !Batch->Adds.IsEmpty() && Batch->Adds[0].Handle == BatchHandle; }))
+		{
+			Iterator.RemoveCurrent();
+		}
+	}
 }
 
 bool UEnhancedAbilitySystemComponent::FindAbilitySpecByAssetTag(const FGameplayTag& AbilityTag, const FGameplayAbilitySpec*& OutSpec) const
@@ -202,30 +312,75 @@ void UEnhancedAbilitySystemComponent::CancelAbilitiesWithTags(const FGameplayTag
 // Enhanced Input
 // ----------------------------------------------------------------------------------------------------------------
 
-void UEnhancedAbilitySystemComponent::Input_AbilityPressed(FGameplayAbilitySpecHandle Handle)
+void UEnhancedAbilitySystemComponent::Input_AbilityPressed(FGameplayAbilitySpecHandle Handle, uint64 Generation)
 {
-	HandleAbilityInputPressed(Handle);
+	if (IsInputBindingCurrent(Handle, Generation))
+	{
+		HandleAbilityInputPressed(Handle);
+	}
 }
 
-void UEnhancedAbilitySystemComponent::Input_AbilityReleased(FGameplayAbilitySpecHandle Handle)
+void UEnhancedAbilitySystemComponent::Input_AbilityReleased(FGameplayAbilitySpecHandle Handle, uint64 Generation)
 {
-	HandleAbilityInputReleased(Handle);
+	if (IsInputBindingCurrent(Handle, Generation))
+	{
+		HandleAbilityInputReleased(Handle);
+	}
 }
 
-void UEnhancedAbilitySystemComponent::Input_AbilityInputConfirmed(FGameplayAbilitySpecHandle Handle)
+void UEnhancedAbilitySystemComponent::Input_AbilityInputConfirmed(const FInputActionInstance& ActionInstance, FGameplayAbilitySpecHandle Handle, uint64 Generation)
 {
-	HandleAbilityInputConfirmed(Handle);
+	if (ShouldDispatchGenericInput(ActionInstance, Handle, Generation, true))
+	{
+		HandleAbilityInputConfirmed(Handle);
+	}
 }
 
-void UEnhancedAbilitySystemComponent::Input_AbilityInputCanceled(FGameplayAbilitySpecHandle Handle)
+void UEnhancedAbilitySystemComponent::Input_AbilityInputCanceled(const FInputActionInstance& ActionInstance, FGameplayAbilitySpecHandle Handle, uint64 Generation)
 {
-	HandleAbilityInputCanceled(Handle);
+	if (ShouldDispatchGenericInput(ActionInstance, Handle, Generation, false))
+	{
+		HandleAbilityInputCanceled(Handle);
+	}
+}
+
+bool UEnhancedAbilitySystemComponent::IsInputBindingCurrent(FGameplayAbilitySpecHandle Handle, uint64 Generation) const
+{
+	const FAbilityInputBinding* Binding = AbilityInputBindings.Find(Handle);
+	return !bAbilityPendingClearAll && Binding && Binding->Generation == Generation && Binding->InputComponent.IsValid()
+		&& Binding->InputComponent.Get() == GetEnhancedInputComponent();
+}
+
+bool UEnhancedAbilitySystemComponent::ShouldDispatchGenericInput(const FInputActionInstance& ActionInstance, FGameplayAbilitySpecHandle Handle, uint64 Generation, bool bConfirm)
+{
+	if (!IsInputBindingCurrent(Handle, Generation) || !IsAbilityActiveByHandle(Handle))
+	{
+		return false;
+	}
+
+	// Shared actions queue one callback per spec, but GAS confirm/cancel is ASC-wide.
+	if (GenericInputFrame != GFrameCounter)
+	{
+		GenericInputFrame = GFrameCounter;
+		ConfirmedInputActions.Reset();
+		CanceledInputActions.Reset();
+	}
+
+	TSet<TWeakObjectPtr<const UInputAction>>& DispatchedActions = bConfirm ? ConfirmedInputActions : CanceledInputActions;
+	const TWeakObjectPtr<const UInputAction> Action = ActionInstance.GetSourceAction();
+	if (DispatchedActions.Contains(Action))
+	{
+		return false;
+	}
+	DispatchedActions.Add(Action);
+	return true;
 }
 
 void UEnhancedAbilitySystemComponent::HandleAbilityInputPressed(FGameplayAbilitySpecHandle Handle)
 {
+	ABILITYLIST_SCOPE_LOCK();
 	FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
-	if (!Spec || !Spec->Ability || Spec->PendingRemove)
+	if (!Spec || !Spec->Ability || Spec->PendingRemove || bAbilityPendingClearAll)
 	{
 		return;
 	}
@@ -253,15 +408,15 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputPressed(FGameplayAbility
 			ServerSetInputPressed(Spec->Handle);
 		}
 
-		AbilitySpecInputPressed(*Spec);
-		InvokeReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed, Spec->Handle, GetPredictionKeyFromSpec(*Spec));
+		DispatchAbilityInputEvent(*Spec, EAbilityGenericReplicatedEvent::InputPressed);
 	}
 }
 
 void UEnhancedAbilitySystemComponent::HandleAbilityInputReleased(FGameplayAbilitySpecHandle Handle)
 {
+	ABILITYLIST_SCOPE_LOCK();
 	FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
-	if (!Spec || !Spec->Ability || Spec->PendingRemove)
+	if (!Spec || !Spec->Ability || Spec->PendingRemove || bAbilityPendingClearAll)
 	{
 		return;
 	}
@@ -278,14 +433,13 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputReleased(FGameplayAbilit
 		ServerSetInputReleased(Spec->Handle);
 	}
 
-	AbilitySpecInputReleased(*Spec);
-	InvokeReplicatedEvent(EAbilityGenericReplicatedEvent::InputReleased, Spec->Handle, GetPredictionKeyFromSpec(*Spec));
+	DispatchAbilityInputEvent(*Spec, EAbilityGenericReplicatedEvent::InputReleased);
 }
 
 void UEnhancedAbilitySystemComponent::HandleAbilityInputConfirmed(FGameplayAbilitySpecHandle Handle)
 {
 	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
-	if (!Spec || !Spec->Ability || Spec->PendingRemove || !Spec->IsActive())
+	if (!Spec || !Spec->Ability || Spec->PendingRemove || bAbilityPendingClearAll || !Spec->IsActive())
 	{
 		return;
 	}
@@ -298,7 +452,7 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputConfirmed(FGameplayAbili
 void UEnhancedAbilitySystemComponent::HandleAbilityInputCanceled(FGameplayAbilitySpecHandle Handle)
 {
 	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
-	if (!Spec || !Spec->Ability || Spec->PendingRemove || !Spec->IsActive())
+	if (!Spec || !Spec->Ability || Spec->PendingRemove || bAbilityPendingClearAll || !Spec->IsActive())
 	{
 		return;
 	}
@@ -307,27 +461,108 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputCanceled(FGameplayAbilit
 	LocalInputCancel();
 }
 
-FPredictionKey UEnhancedAbilitySystemComponent::GetPredictionKeyFromSpec(const FGameplayAbilitySpec& Spec)
+void UEnhancedAbilitySystemComponent::DispatchAbilityInputEvent(FGameplayAbilitySpec& Spec, EAbilityGenericReplicatedEvent::Type EventType)
 {
-	if (const UGameplayAbility* PrimaryInstance = Spec.GetPrimaryInstance())
+	if (Spec.PendingRemove || bAbilityPendingClearAll)
 	{
-		return PrimaryInstance->GetCurrentActivationInfo().GetActivationPredictionKey();
+		return;
 	}
 
-	if (TArray<UGameplayAbility*> Instances = Spec.GetAbilityInstances(); Instances.Num() > 0)
+	const FGameplayAbilitySpecHandle Handle = Spec.Handle;
+	const uint64 Generation = ++AbilityInputEventGenerations.FindOrAdd(Handle);
+	const bool bInputPressed = EventType == EAbilityGenericReplicatedEvent::InputPressed;
+	const TArray<FPredictionKey> PredictionKeys = GetPredictionKeysFromSpec(Spec);
+	struct FInputInstance
 	{
-		return Instances.Last()->GetCurrentActivationInfo().GetActivationPredictionKey();
+		TWeakObjectPtr<UGameplayAbility> Instance;
+		FPredictionKey PredictionKey;
+	};
+	TArray<FInputInstance> OriginalInstances;
+	for (UGameplayAbility* Instance : Spec.GetAbilityInstances())
+	{
+		if (Instance && Instance->IsActive())
+		{
+			OriginalInstances.Add({ Instance, Instance->GetCurrentActivationInfo().GetActivationPredictionKey() });
+		}
 	}
 
-	UE_LOGFMT(LogEnhancedAbilitySystemComponent, Warning, "Falling back to the Deprecated Non-Instanced Activation Prediction Key! | {0}:{1}", __FUNCTION__, __LINE__);
+	// A per-actor instance can restart with the same prediction key during an input callback.
+	TArray<TWeakObjectPtr<UGameplayAbility>> EndedInstances;
+	bool bNonInstancedEnded = false;
+	const FDelegateHandle EndedCallback = OnAbilityEnded.AddLambda([&](const FAbilityEndedData& EndedData)
+	{
+		if (EndedData.AbilitySpecHandle == Handle)
+		{
+			bNonInstancedEnded = OriginalInstances.IsEmpty();
+			EndedInstances.AddUnique(EndedData.AbilityThatEnded);
+		}
+	});
+
+	if (EventType == EAbilityGenericReplicatedEvent::InputPressed)
+	{
+		AbilitySpecInputPressed(Spec);
+	}
+	else
+	{
+		AbilitySpecInputReleased(Spec);
+	}
+
+	for (const FPredictionKey& PredictionKey : PredictionKeys)
+	{
+		// Input callbacks can synchronously release, remap, or press again while the activation stays alive.
+		if (bAbilityPendingClearAll || AbilityInputEventGenerations.FindRef(Handle) != Generation || Spec.InputPressed != bInputPressed)
+		{
+			break;
+		}
+
+		if (Spec.PendingRemove || !Spec.IsActive())
+		{
+			continue;
+		}
+
+		bool bOriginalActivationActive = OriginalInstances.IsEmpty() && !bNonInstancedEnded && GetPredictionKeysFromSpec(Spec).Contains(PredictionKey);
+		for (const FInputInstance& OriginalInstance : OriginalInstances)
+		{
+			const UGameplayAbility* Instance = OriginalInstance.Instance.Get();
+			if (OriginalInstance.PredictionKey == PredictionKey && Instance && !EndedInstances.Contains(OriginalInstance.Instance) && Instance->IsActive() && Instance->GetCurrentActivationInfo().GetActivationPredictionKey() == PredictionKey)
+			{
+				bOriginalActivationActive = true;
+				break;
+			}
+		}
+		if (bOriginalActivationActive)
+		{
+			InvokeReplicatedEvent(EventType, Handle, PredictionKey);
+		}
+	}
+	OnAbilityEnded.Remove(EndedCallback);
+}
+
+TArray<FPredictionKey> UEnhancedAbilitySystemComponent::GetPredictionKeysFromSpec(const FGameplayAbilitySpec& Spec)
+{
+	TArray<FPredictionKey> PredictionKeys;
+	for (const UGameplayAbility* Instance : Spec.GetAbilityInstances())
+	{
+		if (Instance && Instance->IsActive())
+		{
+			PredictionKeys.AddUnique(Instance->GetCurrentActivationInfo().GetActivationPredictionKey());
+		}
+	}
+
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	return Spec.ActivationInfo.GetActivationPredictionKey();
+	if (Spec.Ability && Spec.Ability->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::NonInstanced)
+	{
+		PredictionKeys.Add(Spec.ActivationInfo.GetActivationPredictionKey());
+	}
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
+	return PredictionKeys;
 }
 
 void UEnhancedAbilitySystemComponent::SetInputBinding(const FGameplayAbilitySpecHandle& SpecHandle, const UInputAction* InputAction, const UInputAction* ConfirmInputAction, const UInputAction* CancelInputAction)
 {
-	if (!SpecHandle.IsValid())
+	ABILITYLIST_SCOPE_LOCK();
+
+	if (!SpecHandle.IsValid() || bAbilityPendingClearAll)
 	{
 		return;
 	}
@@ -347,35 +582,49 @@ void UEnhancedAbilitySystemComponent::SetInputBinding(const FGameplayAbilitySpec
 
 	ClearInputBinding(SpecHandle);
 
-	TArray<uint32>& Handles = AbilityInputBindingHandles.FindOrAdd(SpecHandle);
+	// Releasing held input can remove the ability, replace its bindings, or change the avatar.
+	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(SpecHandle);
+	InputComponent = GetEnhancedInputComponent();
+	if (!Spec || Spec->PendingRemove || !InputComponent || AbilityInputBindings.Contains(SpecHandle))
+	{
+		return;
+	}
+
+	FAbilityInputBinding& Binding = AbilityInputBindings.FindOrAdd(SpecHandle);
+	Binding.InputComponent = InputComponent;
+	Binding.Generation = ++InputBindingGeneration;
+	const uint64 Generation = Binding.Generation;
+	TArray<uint32>& Handles = Binding.Handles;
 
 	if (InputAction)
 	{
 		// Use Triggered rather than Started so the Input Action's trigger pipeline (Hold, Tap, Chord,
 		// Combo, etc.) must succeed first. Enhanced Input applies modifiers before this callback.
 		// Triggered may repeat while held, so HandleAbilityInputPressed edge-detects the first frame.
-		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Triggered, this, &ThisClass::Input_AbilityPressed, SpecHandle).GetHandle());
+		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Triggered, this, &ThisClass::Input_AbilityPressed, SpecHandle, Generation).GetHandle());
 
 		// Completed: release after a successful trigger.
-		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Completed, this, &ThisClass::Input_AbilityReleased, SpecHandle).GetHandle());
+		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Completed, this, &ThisClass::Input_AbilityReleased, SpecHandle, Generation).GetHandle());
 
 		// Canceled: release if the trigger didn't finish (e.g. let go during a hold trigger).
-		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Canceled, this, &ThisClass::Input_AbilityReleased, SpecHandle).GetHandle());
+		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Canceled, this, &ThisClass::Input_AbilityReleased, SpecHandle, Generation).GetHandle());
 	}
 
 	if (ConfirmInputAction)
 	{
-		Handles.Add(InputComponent->BindAction(ConfirmInputAction, ETriggerEvent::Started, this, &ThisClass::Input_AbilityInputConfirmed, SpecHandle).GetHandle());
+		Handles.Add(InputComponent->BindAction(ConfirmInputAction, ETriggerEvent::Started, this, &ThisClass::Input_AbilityInputConfirmed, SpecHandle, Generation).GetHandle());
 	}
 
 	if (CancelInputAction)
 	{
-		Handles.Add(InputComponent->BindAction(CancelInputAction, ETriggerEvent::Started, this, &ThisClass::Input_AbilityInputCanceled, SpecHandle).GetHandle());
+		Handles.Add(InputComponent->BindAction(CancelInputAction, ETriggerEvent::Started, this, &ThisClass::Input_AbilityInputCanceled, SpecHandle, Generation).GetHandle());
 	}
 }
 
 void UEnhancedAbilitySystemComponent::BindAbilityInputs()
 {
+	ABILITYLIST_SCOPE_LOCK();
+
 	for (const FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
 	{
 		if (Spec.PendingRemove)
@@ -398,21 +647,33 @@ void UEnhancedAbilitySystemComponent::BindAbilityInputs()
 
 void UEnhancedAbilitySystemComponent::ClearInputBinding(const FGameplayAbilitySpecHandle& SpecHandle)
 {
-	TArray<uint32>* Handles = AbilityInputBindingHandles.Find(SpecHandle);
-	if (!Handles)
+	ABILITYLIST_SCOPE_LOCK();
+
+	FAbilityInputBinding Binding;
+	if (!AbilityInputBindings.RemoveAndCopyValue(SpecHandle, Binding))
 	{
 		return;
 	}
 
-	if (UEnhancedInputComponent* InputComponent = GetEnhancedInputComponent())
+	if (UEnhancedInputComponent* InputComponent = Binding.InputComponent.Get())
 	{
-		for (const uint32 Handle : *Handles)
+		for (const uint32 Handle : Binding.Handles)
 		{
 			InputComponent->RemoveBindingByHandle(Handle);
 		}
 	}
 
-	AbilityInputBindingHandles.Remove(SpecHandle);
+	if (FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(SpecHandle); Spec && Spec->InputPressed)
+	{
+		if (Spec->PendingRemove || bAbilityPendingClearAll)
+		{
+			Spec->InputPressed = false;
+		}
+		else
+		{
+			HandleAbilityInputReleased(SpecHandle);
+		}
+	}
 }
 
 void UEnhancedAbilitySystemComponent::ClearAbilityInputBinding(const FGameplayTag& AbilityTag)
@@ -585,6 +846,7 @@ void UEnhancedAbilitySystemComponent::SetActiveGameplayEffectDuration(const FAct
 		return;
 	}
 
+	FScopedActiveGameplayEffectLock ActiveEffectScopeLock(ActiveGameplayEffects);
 	FActiveGameplayEffect* ActiveEffect = ActiveGameplayEffects.GetActiveGameplayEffect(Handle);
 	if (!ActiveEffect || !ActiveEffect->Spec.Def || ActiveEffect->Spec.Def->DurationPolicy != EGameplayEffectDurationType::HasDuration)
 	{
@@ -630,6 +892,8 @@ void UEnhancedAbilitySystemComponent::SetActiveGameplayEffectDuration(const FAct
 
 	ActiveGameplayEffects.MarkItemDirty(*ActiveEffect);
 	ActiveGameplayEffects.CheckDuration(Handle);
+	// Application callbacks can change pending effects before their original timer is finalized.
+	World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateUObject(this, &ThisClass::CheckDurationExpired, Handle));
 
 	ActiveEffect->EventSet.OnTimeChanged.Broadcast(ActiveEffect->Handle, ActiveEffect->StartWorldTime, ActiveEffect->GetDuration());
 	OnGameplayEffectDurationChange(*ActiveEffect);
