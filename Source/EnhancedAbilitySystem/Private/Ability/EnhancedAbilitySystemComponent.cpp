@@ -385,8 +385,8 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputPressed(FGameplayAbility
 		return;
 	}
 
-	// Triggered can fire every frame while held. Only process its first frame so instant abilities do not
-	// reactivate continuously and failed activations are not retried until the action is released.
+	// Triggered can fire every frame while held.
+	// Only process its first frame so instant abilities do not reactivate continuously and failed activations are not retried until the action is released.
 	if (Spec->InputPressed)
 	{
 		return;
@@ -444,8 +444,8 @@ void UEnhancedAbilitySystemComponent::HandleAbilityInputConfirmed(FGameplayAbili
 		return;
 	}
 
-	// GAS generic confirm is ASC-wide. Restrict each per-ability action to its active owning spec;
-	// the waiting ability task/target actor handles any required replicated event itself.
+	// GAS generic confirm is ASC-wide.
+	// Restrict each per-ability action to its active owning spec; the waiting ability task/target actor handles any required replicated event itself.
 	LocalInputConfirm();
 }
 
@@ -598,8 +598,8 @@ void UEnhancedAbilitySystemComponent::SetInputBinding(const FGameplayAbilitySpec
 
 	if (InputAction)
 	{
-		// Use Triggered rather than Started so the Input Action's trigger pipeline (Hold, Tap, Chord,
-		// Combo, etc.) must succeed first. Enhanced Input applies modifiers before this callback.
+		// Use Triggered rather than Started so the Input Action's trigger pipeline (Hold, Tap, Chord, Combo, etc.) must succeed first.
+		// Enhanced Input applies modifiers before this callback.
 		// Triggered may repeat while held, so HandleAbilityInputPressed edge-detects the first frame.
 		Handles.Add(InputComponent->BindAction(InputAction, ETriggerEvent::Triggered, this, &ThisClass::Input_AbilityPressed, SpecHandle, Generation).GetHandle());
 

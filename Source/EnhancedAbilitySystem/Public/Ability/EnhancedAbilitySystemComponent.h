@@ -27,8 +27,7 @@ enum class EGameplayEffectDurationModification : uint8
 };
 
 /**
- * AbilitySystemComponent that binds UEnhancedGameplayAbility InputActions via Enhanced Input,
- * plus common GAS helpers (cooldown queries, duration tweaks, loose-tag counts, ability active checks).
+ * AbilitySystemComponent that binds UEnhancedGameplayAbility InputActions via Enhanced Input, plus common GAS helpers (cooldown queries, duration tweaks, loose-tag counts, ability active checks).
  * Call BindAbilityInputs() from Pawn::SetupPlayerInputComponent (InputComponent must exist first).
  *
  * Multiplayer notes:
@@ -82,8 +81,7 @@ public:
 	// ----------------------------------------------------------------------------------------------------------------
 
 	// Binds activate / confirm / cancel InputActions for a granted ability handle.
-	// Activate uses Triggered so configured Enhanced Input triggers complete before the press is delivered;
-	// repeated Triggered frames are edge-detected until Completed/Canceled releases the action.
+	// Activate uses Triggered so configured Enhanced Input triggers complete before the press is delivered; repeated Triggered frames are edge-detected until Completed/Canceled releases the action.
 	// Confirm/cancel are GAS-generic (ASC-wide), but only fire while this handle's spec is active.
 	// If all three actions are null, clears existing bindings for that handle (same as ClearInputBinding).
 	void SetInputBinding(const FGameplayAbilitySpecHandle& SpecHandle, const UInputAction* InputAction, const UInputAction* ConfirmInputAction, const UInputAction* CancelInputAction);
@@ -96,18 +94,18 @@ public:
 	UFUNCTION(BlueprintCallable, Meta = (AutoCreateRefTerm = "AbilityTag"), Category = "Ability|Gameplay Ability")
 	void ClearAbilityInputBinding(const FGameplayTag& AbilityTag);
 
-	// Rebind primary InputAction on the primary instance (never mutates the CDO). Pass null to clear the primary action
-	// and rebind confirm/cancel only (or clear entirely if those are also null). The instance remap survives BindAbilityInputs.
+	// Rebind primary InputAction on the primary instance (never mutates the CDO).
+	// Pass null to clear the primary action and rebind confirm/cancel only (or clear entirely if those are also null).
+	// The instance remap survives BindAbilityInputs.
 	// This changes local input state only; call it on the owning client. Prefer ClearAbilityInputBinding to drop binds without remapping.
 	UFUNCTION(BlueprintCallable, Meta = (AutoCreateRefTerm = "AbilityTag"), Category = "Ability|Gameplay Ability")
 	void RemapAbilityInputAction(const FGameplayTag& AbilityTag, const UInputAction* InputAction);
 
 	UEnhancedInputComponent* GetEnhancedInputComponent() const;
 
-	// Re-binds every granted ability's input. OnGiveAbility's bind can silently fail if the avatar
-	// Pawn's InputComponent doesn't exist yet (abilities are granted from PossessedBy, server-authoritative,
-	// which can race PawnClientRestart). Call from Pawn::SetupPlayerInputComponent, which only fires
-	// once InputComponent is guaranteed to exist.
+	// Re-binds every granted ability's input.
+	// OnGiveAbility's bind can silently fail if the avatar Pawn's InputComponent doesn't exist yet (abilities are granted from PossessedBy, server-authoritative, which can race PawnClientRestart).
+	// Call from Pawn::SetupPlayerInputComponent, which only fires once InputComponent is guaranteed to exist.
 	UFUNCTION(BlueprintCallable, Category = "Ability|Gameplay Ability")
 	void BindAbilityInputs();
 
@@ -115,8 +113,8 @@ public:
 	// Cooldowns / active GameplayEffects
 	// ----------------------------------------------------------------------------------------------------------------
 
-	// Longest remaining time among active effects that own any of CooldownTags (typically granted
-	// cooldown tags). Returns false if nothing matches. TimeRemaining/CooldownDuration are zeroed on failure.
+	// Longest remaining time among active effects that own any of CooldownTags (typically granted cooldown tags).
+	// Returns false if nothing matches. TimeRemaining/CooldownDuration are zeroed on failure.
 	UFUNCTION(BlueprintCallable, Meta = (ExpandBoolAsExecs = "ReturnValue", AutoCreateRefTerm = "CooldownTags"), Category = "Ability|Gameplay Effects")
 	bool GetCooldownRemainingForTag(const FGameplayTagContainer& CooldownTags, float& TimeRemaining, float& CooldownDuration) const;
 
@@ -124,8 +122,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ability|Gameplay Effects")
 	int32 GetActiveEffectLevel(const FActiveGameplayEffectHandle& ActiveHandle) const;
 
-	// Asset tags from currently active duration effects that match TagFilter (hierarchical match;
-	// e.g. filter Cooldown returns Cooldown.Fire).
+	// Asset tags from currently active duration effects that match TagFilter (hierarchical match; e.g. filter Cooldown returns Cooldown.Fire).
 	// Useful for UI that lists which cooldowns / timed effects are running.
 	UFUNCTION(BlueprintCallable, Meta = (AutoCreateRefTerm = "TagFilter"), Category = "Ability|Gameplay Effects")
 	void GetActiveGameplayEffectTags(const FGameplayTagContainer& TagFilter, TArray<FGameplayTag>& OutTags) const;
@@ -152,8 +149,8 @@ public:
 	// Count: when bOverride is false, +N adds / -N removes; when true, sets the aggregate explicit count.
 	// bOverride: true = absolute set, false = delta.
 	// Coordinate overrides/removals when other sources grant the same tag; GAS does not isolate these counts.
-	// Loose tags are NOT automatically replicated - authority and owning client must stay in sync yourself
-	// (or use GE-granted tags when multiplayer visibility matters). Use GetGameplayTagCount for queries.
+	// Loose tags are NOT automatically replicated - authority and owning client must stay in sync yourself (or use GE-granted tags when multiplayer visibility matters).
+	// Use GetGameplayTagCount for queries.
 	UFUNCTION(BlueprintCallable, Meta = (AutoCreateRefTerm = "GameplayTag"), Category = "Ability|Gameplay Tags")
 	void UpdateLooseGameplayTagCount(const FGameplayTag& GameplayTag, int32 Count = 1, bool bOverride = false);
 

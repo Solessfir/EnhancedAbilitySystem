@@ -9,8 +9,7 @@
 class UInputAction;
 
 /**
- * GameplayAbility base with Enhanced Input action slots (activate / confirm / cancel),
- * lightweight UI metadata, and optional dynamic (tag + SetByCaller) cooldowns.
+ * GameplayAbility base with Enhanced Input action slots (activate / confirm / cancel), lightweight UI metadata, and optional dynamic (tag + SetByCaller) cooldowns.
  * Pair with UEnhancedAbilitySystemComponent for input binding.
  *
  * Cooldown setup (this plugin's path):
@@ -57,8 +56,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ability|Cooldown")
 	bool HasCooldownDuration() const;
 
-	// Cooldown length at current ability level: optional duration when the tagged SetByCaller GE can use it,
-	// otherwise the GE's static duration magnitude when readable. 0 if missing/infinite/instant/unknown.
+	// Cooldown length at current ability level: optional duration when the tagged SetByCaller GE can use it, otherwise the GE's static duration magnitude when readable.
+	// 0 if missing/infinite/instant/unknown.
 	// For remaining time use engine GetCooldownTimeRemaining (respects overridden GetCooldownTags).
 	UFUNCTION(BlueprintPure, Category = "Ability|Cooldown")
 	float GetCooldownDuration() const;

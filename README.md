@@ -1,6 +1,6 @@
 # Enhanced Ability System
 
-Gameplay Ability System base for Unreal Engine with **Enhanced Input** ability binding. Assign `InputAction` / Confirm / Cancel on abilities; the ASC binds press, release, and targeting confirm/cancel for you.
+Gameplay Ability System base for Unreal Engine with **Enhanced Input** ability binding. Assign `InputAction` (Confirm/Cancel) on Abilities; the ASC binds press, release, and targeting confirm/cancel for you.
 
 ## Installation
 
@@ -44,8 +44,7 @@ void AMyCharacter::PossessedBy(AController* NewController)
 
 	if (AbilitySystemComponent)
 	{
-		// Owner and avatar are the same actor when the ASC lives on the Character
-		// (no PlayerState indirection).
+		// Owner and avatar are the same actor when the ASC lives on the Character (no PlayerState indirection).
 		AbilitySystemComponent->InitAbilityActorInfo(this, this);
 		GrantDefaultAbilities(); // authority only inside
 	}
